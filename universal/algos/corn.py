@@ -48,7 +48,8 @@ class CORN(Algo):
         self.step = self.step_fast if self.fast_version else self.step_slow
 
 
-    def init_weights(self, m):
+    def init_weights(self, columns):
+        m = len(columns)
         return np.ones(m) / m
 
 
@@ -75,12 +76,12 @@ class CORN(Algo):
             # calculate correlation with predecesors
             X_t = history.iloc[-window:].values.flatten()
             for i in range(window, len(history)):
-                X_i = history.ix[i-window:i-1].values.flatten()
+                X_i = history.iloc[i-window:i-1].values.flatten()
                 if np.corrcoef(X_t, X_i)[0,1] >= self.rho:
                     indices.append(i)
 
             # calculate optimal portfolio
-            C = history.ix[indices, :]
+            C = history.iloc[indices, :]
 
             if C.shape[0] == 0:
                 b = np.ones(m) / float(m)
@@ -90,7 +91,7 @@ class CORN(Algo):
             return b
 
 
-    def step_fast(self, x, last_b):
+    def step_fast(self, x, last_b, history):
         # iterate time
         self.t += 1
 
@@ -101,11 +102,11 @@ class CORN(Algo):
             window = self.window
             m = len(x)
 
-            X_t = self.X_flat.ix[self.t]
+            X_t = self.X_flat.iloc[self.t]
             X_i = self.X_flat.iloc[window-1 : self.t]
             c = X_i.apply(lambda r: np.corrcoef(r.values, X_t.values)[0,1], axis=1)
 
-            C = self.X.ix[c.index[c >= self.rho] + 1]
+            C = self.X.iloc[c.index[c >= self.rho] + 1]
 
             if C.shape[0] == 0:
                 b = np.ones(m) / float(m)

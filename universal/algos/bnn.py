@@ -29,7 +29,8 @@ class BNN(Algo):
         self.l = l
 
 
-    def init_weights(self, m):
+    def init_weights(self, columns):
+        m = len(columns)
         return np.ones(m) / m
 
 
@@ -57,7 +58,7 @@ class BNN(Algo):
         D = D.sum(1).iloc[:-1]
 
         # sort and find nearest neighbors
-        D.sort()
+        D = D.sort_values()
         return D.index[:l]
 
 

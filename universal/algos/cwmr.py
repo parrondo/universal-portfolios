@@ -36,7 +36,8 @@ class CWMR(Algo):
         self.theta = scipy.stats.norm.ppf(confidence)
 
 
-    def init_weights(self, m):
+    def init_weights(self, columns):
+        m = len(columns)
         return np.ones(m) / m
 
 
@@ -45,7 +46,7 @@ class CWMR(Algo):
         self.sigma = np.matrix(np.eye(m) / m**2)
 
 
-    def step(self, x, last_b):
+    def step(self, x, last_b, history):
         # initialize
         m = len(x)
         mu = np.matrix(last_b).T

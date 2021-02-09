@@ -1,8 +1,12 @@
 import numpy as np
 import pandas as pd
+import hashlib
 import matplotlib.pyplot as plt
 import pickle
 from universal import tools
+import seaborn as sns
+from statsmodels.api import OLS
+from matplotlib.colors import ListedColormap
 
 
 class PickleMixin(object):
@@ -38,8 +42,18 @@ class AlgoResult(PickleMixin):
         self.rf_rate = 0.
         self._X = X
 
+        assert self.X.max().max() < np.inf
+
         # update logarithms, fees, etc.
         self._recalculate()
+
+    def set_rf_rate(self, rf_rate):
+        if isinstance(rf_rate, float):
+            self.rf_rate = rf_rate
+        else:
+            self.rf_rate = rf_rate.reindex(self.X.index)
+        self._recalculate()
+        return self
 
     @property
     def X(self):
@@ -85,10 +99,13 @@ class AlgoResult(PickleMixin):
         # stock went bankrupt
         self.r[self.r < 0] = 0.
 
+        # add risk-free asset
+        self.r -= (self.B.sum(axis=1) - 1) * self.rf_rate / self.freq()
+
         # add fees
         if not isinstance(self._fee, float) or self._fee != 0:
             fees = (self.B.shift(-1).mul(self.r, axis=0) - self.B * self.X).abs()
-            fees.iloc[0] = self.B.ix[0]
+            fees.iloc[0] = self.B.iloc[0]
             fees.iloc[-1] = 0.
             fees *= self._fee
 
@@ -130,13 +147,78 @@ class AlgoResult(PickleMixin):
         """ Compute annualized sharpe ratio from log returns. If data does
         not contain datetime index, assume daily frequency with 252 trading days a year.
         """
-        return tools.sharpe(self.r_log, rf_rate=self.rf_rate, freq=self.freq())
+        return tools.sharpe(self.r - 1, rf_rate=self.rf_rate, freq=self.freq())
+
+    @property
+    def sharpe_std(self):
+        return tools.sharpe_std(self.r - 1, rf_rate=self.rf_rate, freq=self.freq())
+
+    @property
+    def ucrp_sharpe(self):
+        from universal.algos import CRP
+        result = CRP().run(self.X.cumprod())
+        result.set_rf_rate(self.rf_rate)
+        return result.sharpe
+
+    @property
+    def ucrp_sharpe_std(self):
+        from universal.algos import CRP
+        result = CRP().run(self.X.cumprod())
+        result.set_rf_rate(self.rf_rate)
+        return result.sharpe_std
+
+    def _capm_ucrp(self):
+        y = (self.r).cumprod()
+        y.name = 'r'
+        bases = (self.ucrp_r).cumprod().to_frame()
+        bases.columns = ['ucrp']
+
+        return tools.capm(y, bases, rf=self.rf_rate)
+
+    @property
+    def appraisal_ucrp(self):
+        c = self._capm_ucrp()
+        alpha = c['alpha']
+        sd = c['residual'].pct_change().std() * np.sqrt(self.freq())
+        # regularization term in case sd is too low
+        return alpha / (sd + 1e-3)
+
+    @property
+    def appraisal_ucrp_std(self):
+        c = self._capm_ucrp()
+        sd = c['residual'].pct_change().std()
+        alpha_std = np.sqrt(c['model'].cov_params().loc['Intercept', 'Intercept']) / sd * np.sqrt(self.freq())
+        return alpha_std
+
+    @property
+    def appraisal_capm(self):
+        y = (self.r).cumprod()
+        y.name = 'r'
+        c = tools.capm(y, self.X.cumprod(), rf=self.rf_rate)
+
+        alpha = c['alpha']
+        sd = c['residual'].pct_change().std() * np.sqrt(self.freq())
+        # regularization term in case sd is too low
+        return alpha / (sd + 1e-3)
+
+    @property
+    def appraisal_capm_std(self):
+        y = (self.r).cumprod()
+        y.name = 'r'
+        c = tools.capm(y, self.X.cumprod(), rf=self.rf_rate)
+
+        sd = c['residual'].pct_change().std()
+        alpha_std = np.sqrt(c['model'].cov_params().loc['Intercept', 'Intercept']) / sd * np.sqrt(self.freq())
+        return alpha_std
+
+    @property
+    def ulcer(self):
+        return tools.ulcer(self.r - 1, rf_rate=self.rf_rate, freq=self.freq())
 
     @property
     def information(self):
         """ Information ratio benchmarked against uniform CRP portfolio. """
-        s = self.X.mean(axis=1)
-        x = self.r_log - np.log(s)
+        x = self.r - self.ucrp_r
 
         mu, sd = x.mean(), x.std()
 
@@ -149,6 +231,13 @@ class AlgoResult(PickleMixin):
             return 0.
 
     @property
+    def ucrp_sharpe(self):
+        from .algos import CRP
+        result = CRP().run(self.X.cumprod())
+        result.set_rf_rate(self.rf_rate)
+        return result.sharpe
+
+    @property
     def growth_rate(self):
         return self.r_log.mean() * self.freq()
 
@@ -158,11 +247,11 @@ class AlgoResult(PickleMixin):
 
     @property
     def annualized_return(self):
-        return np.exp(self.r_log.mean() * self.freq()) - 1
+        return (self.r.mean() - 1) * self.freq()
 
     @property
     def annualized_volatility(self):
-        return np.exp(self.r_log).std() * np.sqrt(self.freq())
+        return self.r.std() * np.sqrt(self.freq())
 
     @property
     def drawdown_period(self):
@@ -192,33 +281,73 @@ class AlgoResult(PickleMixin):
         all_trades = (x != 0).sum()
         return float(win) / all_trades
 
+    @property
+    def turnover(self):
+        B = self.B
+        X = self.X
+
+        # equity increase
+        E = (B * (X - 1)).sum(axis=1) + 1
+
+        # required new assets
+        R = B.shift(-1).multiply(E, axis=0) / X
+
+        D = R - B
+
+        # rebalancing
+        return D.abs().sum().sum() / (len(B) / self.freq())
+
     def freq(self, x=None):
         """ Number of data items per year. If data does not contain
         datetime index, assume daily frequency with 252 trading days a year."""
         x = x or self.r
         return tools.freq(x.index)
 
+    @property
+    def ucrp_r(self):
+        return (self.X.drop('CASH', axis=1, errors='ignore') - 1).mean(1) + 1
+
+    @property
+    def residual_r(self):
+        """Portfolio minus UCRP"""
+        _, beta = self.alpha_beta()
+        return (self.r - 1) - beta * (self.ucrp_r - 1) + 1
+
+    @property
+    def residual_capm(self):
+        """Portfolio minus CAPM"""
+        y = (self.r).cumprod()
+        y.name = 'r'
+        c = tools.capm(y, self.X.cumprod(), rf=self.rf_rate)
+        return c['residual'].pct_change() + 1
+
+    def alpha_beta(self):
+        y = (self.r).cumprod()
+        y.name = 'r'
+        bases = (self.ucrp_r).cumprod().to_frame()
+        bases.columns = ['ucrp']
+
+        c = tools.capm(y, bases, rf=self.rf_rate)
+        return c['alpha'], c['betas']['ucrp']
+
     def summary(self, name=None):
-        return """Summary{}:
-    Profit factor: {:.2f}
-    Sharpe ratio: {:.2f}
-    Information ratio (wrt UCRP): {:.2f}
-    Annualized return: {:.2f}%
-    Annualized volatility: {:.2f}%
-    Longest drawdown: {:.0f} days
-    Max drawdown: {:.2f}%
-    Winning days: {:.1f}%
-        """.format(
-            '' if name is None else ' for ' + name,
-            self.profit_factor,
-            self.sharpe,
-            self.information,
-            100 * self.annualized_return,
-            100 * self.annualized_volatility,
-            self.drawdown_period,
-            100 * self.max_drawdown,
-            100 * self.winning_pct
-            )
+        alpha, beta = self.alpha_beta()
+        return f"""Summary{'' if name is None else ' for ' + name}:
+    Profit factor: {self.profit_factor:.2f}
+    Sharpe ratio: {self.sharpe:.2f} ± {self.sharpe_std:.2f}
+    Ulcer index: {self.ulcer:.2f}
+    Information ratio (wrt UCRP): {self.information:.2f}
+    Appraisal ratio (CAPM): {self.appraisal_capm:.2f} ± {self.appraisal_capm_std:.2f}
+    Appraisal ratio (wrt UCRP): {self.appraisal_ucrp:.2f} ± {self.appraisal_ucrp_std:.2f}
+    UCRP sharpe: {self.ucrp_sharpe:.2f} ± {self.ucrp_sharpe_std:.2f}
+    Beta / Alpha: {beta:.2f} / {alpha:.3%}
+    Annualized return: {self.annualized_return:.2%}
+    Annualized volatility: {self.annualized_volatility:.2%}
+    Longest drawdown: {self.drawdown_period:.0f} days
+    Max drawdown: {self.max_drawdown:.2%}
+    Winning days: {self.winning_pct:.1%}
+    Annual turnover: {self.turnover:.1f}
+        """
 
     def plot(self, weights=True, assets=True, portfolio_label='PORTFOLIO', show_only_important=True, **kwargs):
         """ Plot equity of all assets plus our strategy.
@@ -232,10 +361,11 @@ class AlgoResult(PickleMixin):
             return [ax1]
         else:
             if show_only_important:
-                ix = self.B.abs().sum().sort_values(ascending=False).index[:20]
-                B = self.B[ix].copy()
+                ix = self.B.abs().sum().nlargest(n=20).index
+                B = self.B.loc[:, ix].copy()
                 assets = B.columns if assets else False
-                B['others'] = self.B.drop(ix, 1).sum(1)
+                if B.shape[1] > 20:
+                    B['_others'] = self.B.drop(ix, 1).sum(1)
             else:
                 B = self.B.copy()
 
@@ -246,16 +376,18 @@ class AlgoResult(PickleMixin):
 
             # plot weights as lines
             if B.drop(['CASH'], 1, errors='ignore').values.min() < -0.01:
+                B = B.sort_index(axis=1)
                 B.plot(ax=ax2, ylim=(min(0., B.values.min()), max(1., B.values.max())),
-                       legend=False, colormap=plt.get_cmap('jet'))
+                                          legend=False, color=_colors_hash(B.columns))
             else:
+                B = B.drop('CASH', 1, errors='ignore')
                 # fix rounding errors near zero
                 if B.values.min() < 0:
                     pB = B - B.values.min()
                 else:
                     pB = B
                 pB.plot(ax=ax2, ylim=(0., max(1., pB.sum(1).max())),
-                        legend=False, colormap=plt.get_cmap('jet'), kind='area', stacked=True)
+                                           legend=False, color=_colors_hash(pB.columns), kind='area', stacked=True)
             plt.ylabel('weights')
             return [ax1, ax2]
 
@@ -265,7 +397,7 @@ class AlgoResult(PickleMixin):
         :return: New AlgoResult object.
         """
         if result is None:
-            from algos import CRP
+            from .algos import CRP
             result = CRP().run(self.X.cumprod())
 
         return AlgoResult(self.X, self.B - result.B)
@@ -293,7 +425,7 @@ class ListResult(list, PickleMixin):
     def __init__(self, results=None, names=None):
         results = results if results is not None else []
         names = names if names is not None else []
-        super(ListResult, self).__init__(results)
+        super().__init__(results)
         self.names = names
 
     def append(self, result, name):
@@ -335,37 +467,19 @@ class ListResult(list, PickleMixin):
     def summary(self):
         return '\n'.join([result.summary(name) for result, name in zip(self, self.names)])
 
-    def plot(self, ucrp=False, bah=False, assets=False, **kwargs):
+    def plot(self, ucrp=False, bah=False, residual=False, capm_residual=False, assets=False, **kwargs):
         """ Plot strategy equity.
         :param ucrp: Add uniform CRP as a benchmark.
         :param bah: Add Buy-And-Hold portfolio as a benchmark.
+        :param residual: Add portfolio minus UCRP as a benchmark.
+        :param capm_residual: Add portfolio minus CAPM proxy as a benchmark.
         :param assets: Add asset prices.
         :param kwargs: Additional arguments for pd.DataFrame.plot
         """
         # NOTE: order of plotting is important because of coloring
         # plot portfolio
         d = self.to_dataframe()
-        portfolio = d.copy()
-        ax = portfolio.plot(linewidth=3., legend=False, **kwargs)
-        kwargs['ax'] = ax
-
-        ax.set_ylabel('Total wealth')
-
-        # plot uniform constant rebalanced portfolio
-        if ucrp:
-            from algos import CRP
-            crp_algo = CRP().run(self[0].X.cumprod())
-            crp_algo.fee = self[0].fee
-            d['UCRP'] = crp_algo.equity
-            d[['UCRP']].plot(**kwargs)
-
-        # add bah
-        if bah:
-            from algos import BAH
-            bah_algo = BAH().run(self[0].X.cumprod())
-            bah_algo.fee = self[0].fee
-            d['BAH'] = bah_algo.equity
-            d[['BAH']].plot(**kwargs)
+        D = d.copy()
 
         # add individual assets
         if isinstance(assets, bool):
@@ -373,11 +487,48 @@ class ListResult(list, PickleMixin):
                 assets = self[0].asset_equity.columns
             else:
                 assets = []
-        if list(assets):
-            self[0].asset_equity[assets].plot(colormap=plt.get_cmap('jet'), **kwargs)
 
-        # plot portfolio again to highlight it
-        kwargs['color'] = 'blue'
-        portfolio.plot(linewidth=3., **kwargs)
+        if list(assets):
+            D = D.join(self[0].asset_equity)
+
+        ax = D.plot(color=_colors_hash(D.columns), **kwargs)
+        kwargs['ax'] = ax
+
+        ax.set_ylabel('Total wealth')
+
+        # plot residual strategy
+        if residual:
+            d['RESIDUAL'] = self[0].residual_r.cumprod()
+            d[['RESIDUAL']].plot(**kwargs)
+        if capm_residual:
+            d['CAPM_RESIDUAL'] = self[0].residual_capm.cumprod()
+            d[['CAPM_RESIDUAL']].plot(**kwargs)
+
+        # plot uniform constant rebalanced portfolio
+        if ucrp:
+            from .algos import CRP
+            crp_algo = CRP().run(self[0].X.cumprod())
+            crp_algo.fee = self[0].fee
+            d['UCRP'] = crp_algo.equity
+            d[['UCRP']].plot(**kwargs)
+
+        # add bah
+        if bah:
+            from .algos import BAH
+            bah_algo = BAH().run(self[0].X.cumprod())
+            bah_algo.fee = self[0].fee
+            d['BAH'] = bah_algo.equity
+            d[['BAH']].plot(**kwargs)
 
         return ax
+
+
+def _colors(n):
+    return sns.color_palette(n_colors=n)
+
+def _hash(s):
+    return int(hashlib.sha1(s.encode()).hexdigest(), 16)
+
+def _colors_hash(columns, n=19):
+    palette = sns.color_palette(n_colors=n)
+    return ['blue' if c == 'PORTFOLIO' else palette[_hash(c) % n] for c in columns]

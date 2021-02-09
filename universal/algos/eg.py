@@ -23,11 +23,12 @@ class EG(Algo):
         self.eta = eta
 
 
-    def init_weights(self, m):
+    def init_weights(self, columns):
+        m = len(columns)
         return np.ones(m) / m
 
 
-    def step(self, x, last_b):
+    def step(self, x, last_b, history):
         b = last_b * np.exp(self.eta * x / sum(x * last_b))
         return b / sum(b)
 

@@ -18,9 +18,9 @@ class MPT(Algo):
 
     PRICE_TYPE = 'ratio'
 
-    def __init__(self, mu_estimator=None, cov_estimator=None, cov_window=None,
-                 min_history=None, max_leverage=1., method='mpt', q=0.01, gamma=0., allow_cash=False,
-                 optimizer_options=None, **kwargs):
+    def __init__(self, window=None, mu_estimator=None, cov_estimator=None, mu_window=None, cov_window=None,
+                 min_history=None, bounds=None, max_leverage=1., method='mpt', q=0.01, gamma=0.,
+                 optimizer_options=None, force_weights=None, **kwargs):
         """
         :param window: Window for calculating mean and variance. Use None for entire history.
         :param mu_estimator: TODO
@@ -29,16 +29,23 @@ class MPT(Algo):
         :param max_leverage: Max leverage to use.
         :param method: optimization objective - can be "mpt", "sharpe" and "variance"
         :param q: depends on method, e.g. for "mpt" it is risk aversion parameter (higher means lower aversion to risk)
+            from https://en.wikipedia.org/wiki/Modern_portfolio_theory#Efficient_frontier_with_no_risk-free_asset
+            q=2 is equivalent to full-kelly, q=1 is equivalent to half kelly
         :param gamma: Penalize changing weights (can be number or Series with individual weights such as fees)
-        :param allow_cash: Allow holding cash (weights doesn't have to sum to 1)
         """
-        super(MPT, self).__init__(min_history=min_history, **kwargs)
-        self.max_leverage = max_leverage
+        super().__init__(min_history=min_history, **kwargs)
+        mu_window = mu_window or window
+        cov_window = cov_window or window
         self.method = method
         self.q = q
         self.gamma = gamma
-        self.allow_cash = allow_cash
+        self.bounds = bounds or {}
+        self.force_weights = force_weights
+        self.max_leverage = max_leverage
         self.optimizer_options = optimizer_options or {}
+
+        if bounds and max_leverage != 1:
+            raise NotImplemented('max_leverage cannot be used with bounds, consider removing max_leverage and replace it with bounds1')
 
         if cov_estimator is None:
             cov_estimator = 'empirical'
@@ -67,7 +74,7 @@ class MPT(Algo):
 
         if isinstance(mu_estimator, string_types):
             if mu_estimator == 'historical':
-                mu_estimator = HistoricalEstimator(window=cov_window)
+                mu_estimator = HistoricalEstimator(window=mu_window)
             elif mu_estimator == 'sharpe':
                 mu_estimator = SharpeEstimator()
             else:
@@ -75,6 +82,10 @@ class MPT(Algo):
 
         self.cov_estimator = cov_estimator
         self.mu_estimator = mu_estimator
+
+    def init_weights(self, columns):
+        b = np.array([0. if c == 'CASH' else 1. for c in columns])
+        return b / b.sum()
 
     def init_step(self, X):
         # set min history to 1 year
@@ -104,33 +115,36 @@ class MPT(Algo):
 
             self.cov_estimator = CovarianceEstimator(EmpiricalCov(X, self.cov_estimator.window, self.min_history))
 
-    def estimate_mu_sigma(self, S):
+    def estimate_mu_sigma_sh(self, S):
         X = self._convert_prices(S, self.PRICE_TYPE, self.REPLACE_MISSING)
 
-        sigma = self.cov_estimator.fit(X)
+        sigma = self.cov_estimator.fit(X - 1)
         mu = self.mu_estimator.fit(X, sigma)
+        vol = np.sqrt(np.diag(sigma))
+        sh = (mu - self.mu_estimator.rfr) / vol
+        sh[vol == 0] = 0.
 
-        return mu, sigma
+        return mu, sigma, sh
 
     def portfolio_mu(self, last_b, mu):
         return (last_b * mu).sum()
 
     def portfolio_vol(self, last_b, sigma):
-        w = np.matrix(last_b)
-        sigma = np.matrix(sigma.reindex(index=last_b.index, columns=last_b.index))
-        return np.sqrt((w * sigma * w.T)[0, 0])
+        w = last_b.values
+        sigma = sigma.reindex(index=last_b.index, columns=last_b.index).values
+        return np.sqrt((w @ sigma @ w))
 
     def portfolio_gradient(self, last_b, mu, sigma, q=None, decompose=False):
         """ Calculate gradient for given objective function. Can be used to determine which stocks
         should be added / removed from portfolio.
         """
         q = q or self.q
-        w = np.matrix(last_b)
-        mu = np.matrix(mu)
-        sigma = np.matrix(sigma)
+        w = last_b.values
+        mu = mu.values
+        sigma = sigma.values
 
-        p_vol = np.sqrt(w * sigma * w.T + q)
-        p_mu = w * mu.T
+        p_vol = np.sqrt(w @ sigma @ w)
+        p_mu = w @ mu
 
         if self.method == 'sharpe':
             grad_sharpe = mu.T / p_vol
@@ -145,8 +159,8 @@ class MPT(Algo):
                 return grad_sharpe + grad_vol
         elif self.method == 'mpt':
             grad_mu = pd.Series(np.array(mu).ravel(), index=last_b.index)
-            grad_sigma = pd.Series(np.array(sigma * w.T).ravel(), index=last_b.index)
-            grad_vol = pd.Series(np.array(-sigma * w.T / p_vol).ravel(), index=last_b.index)
+            grad_sigma = pd.Series((sigma @ w).ravel(), index=last_b.index)
+            grad_vol = pd.Series(np.array(-sigma @ w / p_vol).ravel(), index=last_b.index)
 
             if decompose:
                 return grad_mu, grad_vol
@@ -159,6 +173,9 @@ class MPT(Algo):
         # get sigma and mu estimates
         X = history
 
+        if self.bounds.keys() - X.columns - {'all'}:
+            raise Exception(f'Bounds for undefined symbols {self.bounds.keys() - X.columns - set(["all"])}')
+
         # remove assets with NaN values
         # cov_est = self.cov_estimator.cov_est
         # if hasattr(cov_est, 'allow_nan') and cov_est.allow_nan:
@@ -166,15 +183,22 @@ class MPT(Algo):
         # else:
         #     na_assets = X.isnull().any().values
 
-        na_assets = (X.notnull().sum() <= self.min_history).values
+        # check NA assets
+        na_assets = (X.notnull().sum() < self.min_history).values
+        if any(na_assets):
+            raise Exception('Assets containing null values: {}'.format(X.columns[na_assets]))
 
         X = X.iloc[:, ~na_assets]
         x = x[~na_assets]
         last_b = last_b[~na_assets]
 
         # get sigma and mu estimations
-        sigma = self.cov_estimator.fit(X)
+        sigma = self.cov_estimator.fit(X - 1)
         mu = self.mu_estimator.fit(X, sigma)
+
+        ss = pd.Series(np.diag(sigma), index=sigma.columns)
+
+        assert (mu.index == X.columns).all()
 
         # make Series from gamma
         gamma = self.gamma
@@ -191,12 +215,13 @@ class MPT(Algo):
         # find optimal portfolio
         last_b = pd.Series(last_b, index=x.index, name=x.name)
         b = self.optimize(mu, sigma, q=self.q, gamma=gamma, max_leverage=self.max_leverage, last_b=last_b, **kwargs)
+        b = pd.Series(b, index=X.columns).reindex(history.columns, fill_value=0.)
 
-        return pd.Series(b, index=X.columns).reindex(history.columns, fill_value=0.)
+        return b
 
     def optimize(self, mu, sigma, q, gamma, max_leverage, last_b, **kwargs):
         if self.method == 'mpt':
-            return self._optimize_mpt(mu, sigma, q, gamma, max_leverage, last_b, **kwargs)
+            return self._optimize_mpt(mu, sigma, q, gamma, last_b, **kwargs)
         elif self.method == 'sharpe':
             return self._optimize_sharpe(mu, sigma, q, gamma, max_leverage, last_b, **kwargs)
         elif self.method == 'variance':
@@ -204,7 +229,7 @@ class MPT(Algo):
         else:
             raise Exception('Unknown method {}'.format(self.method))
 
-    def _optimize_sharpe(self, mu, sigma, q, gamma, max_leverage, last_b, allow_sell=True):
+    def _optimize_sharpe(self, mu, sigma, q, gamma, max_leverage, last_b):
         """ Maximize sharpe ratio b.T * mu / sqrt(b.T * sigma * b + q) """
         mu = np.matrix(mu)
         sigma = np.matrix(sigma)
@@ -222,10 +247,10 @@ class MPT(Algo):
         else:
             cons = ({'type': 'eq', 'fun': lambda b: max_leverage - sum(b)},)
 
-        if allow_sell:
-            bounds = [(0., max_leverage)]*len(last_b)
-        else:
-            bounds = [(0, max_leverage) if sym == 'CASH' else (w, max_leverage) for sym, w in last_b.iteritems()]
+        bounds = [(0., max_leverage)] * len(last_b)
+
+        if self.max_weight:
+            bounds = [(max(l, -self.max_weight), min(u, self.max_weight)) for l, u in bounds]
 
         x0 = last_b
         MAX_TRIES = 3
@@ -244,93 +269,55 @@ class MPT(Algo):
 
         return res.x
 
-    def _optimize_mpt(self, mu, sigma, q, gamma, max_leverage, last_b, allow_sell=True):
+    def _optimize_mpt(self, mu, sigma, q, gamma, last_b):
         """ Minimize b.T * sigma * b - q * b.T * mu """
-        has_cash = 'CASH' in mu.index
+        assert (mu.index == sigma.columns).all()
+        assert (mu.index == last_b.index).all()
+
         symbols = list(mu.index)
-        if has_cash:
-            cash_ix = mu.index.get_loc('CASH')
-        sigma = np.matrix(sigma)
-        mu = np.matrix(mu).T
+        sigma = np.array(sigma)
+        mu = np.array(mu).T
+        n = len(symbols)
 
-        if isinstance(allow_sell, bool):
-            allow_sell = set(symbols) if allow_sell else set()
-        allow_sell = allow_sell | {'CASH'}
+        force_weights = self.force_weights or {}
 
-        # regularization parameter for singular cases
-        ALPHA = 0.000001
+        # portfolio constraints
+        bounds = self.bounds or {}
+        if 'all' not in bounds:
+            bounds['all'] = (0, 1)
 
-        def maximize(mu, sigma, q):
-            n = len(last_b)
+        G = []
+        h = []
+        for i, sym in enumerate(symbols):
+            # forced weights
+            if sym in force_weights:
+                continue
 
-            P = matrix(2 * (sigma + ALPHA * np.eye(n)))
-            q = matrix(-q * mu + 2 * ALPHA * np.matrix(last_b).T)
-            G = matrix(-np.eye(n))
-            h = matrix(np.zeros(n))
+            # constraints
+            lower, upper = bounds.get(sym, bounds['all'])
+            if lower is not None:
+                r = np.zeros(n)
+                r[i] = -1
+                G.append(r)
+                h.append(-lower)
 
-            # CASH have different constraints
-            if has_cash:
-                h[cash_ix] = max_leverage - 1.
+            if upper is not None:
+                r = np.zeros(n)
+                r[i] = 1
+                G.append(r)
+                h.append(upper)
 
-            # additional constraints on selling
-            cG = matrix(-np.eye(n))
-            ch = -matrix(last_b)
+            # # additional constraints on selling
+            # if sym not in allow_sell:
+            #     r = np.zeros(n)
+            #     r[i] = -1
+            #     G.append(r)
+            #     h.append(-last_b[i])
 
-            # remove those constraints for selected indices
-            for sym in allow_sell:
-                ix = symbols.index(sym)
-                cG[ix, ix] = 0.
-                ch[ix] = ALPHA    # causing numerical problems
+        G = matrix(np.vstack(G).astype(float))
+        h = matrix(np.array(h).astype(float))
 
-            G = matrix(np.r_[G, cG])
-            h = matrix(np.r_[h, ch])
-
-            if max_leverage is None or max_leverage == float('inf'):
-                sol = solvers.qp(P, q, G, h)
-            else:
-                A = matrix(np.ones(n)).T
-                b = matrix(np.array([1.]))
-
-                # min_eigval = np.linalg.eig(P)[0].min()
-                # assert min_eigval > 0, 'Covariance matrix is not convex!'
-
-                sol = solvers.qp(P, q, G, h, A, b, initvals=last_b)
-
-                # if self.allow_cash:
-                #     G = matrix(np.r_[G, matrix(np.ones(n)).T])
-                #     h = matrix(np.r_[h, matrix([self.max_leverage])])
-                #     sol = solvers.qp(P, q, G, h, initvals=last_b)
-                # else:
-                #     A = matrix(np.ones(n)).T
-                #     b = matrix(np.array([max_leverage]))
-                #     sol = solvers.qp(P, q, G, h, A, b, initvals=last_b)
-
-            if sol['status'] != 'optimal':
-                logging.warning("Solution not found for {}, using last weights".format(last_b.name))
-                return last_b
-
-            return np.squeeze(sol['x'])
-
-        def maximize_with_penalization(b, last_b, mu, sigma, q, gamma):
-            n = len(mu)
-            c = np.sign(b - last_b)
-            sigma = matrix(sigma)
-            mu = matrix(mu)
-
-            P = 2 * (sigma + ALPHA * matrix(np.eye(n)))
-            qq = 2 * sigma * matrix(last_b) - q * mu + matrix(gamma * c)
-
-            G = matrix(np.r_[-np.diag(c), np.eye(n), -np.eye(n)])
-            h = matrix(np.r_[np.zeros(n), self.max_leverage - last_b, last_b])
-
-            A = matrix(np.ones(n)).T
-            b = matrix([self.max_leverage - sum(last_b)])
-
-            sol = solvers.qp(P, qq, G, h, A, b, initvals=np.zeros(n))
-
-            return np.squeeze(sol['x']) + np.array(last_b)
-
-        b = maximize(mu, sigma, q)
+        b = _maximize(mu, sigma, q, n, G, h, symbols, last_b, force_weights)
         # try:
         #     b = maximize(mu, sigma, q)
         # except ValueError as e:
@@ -387,45 +374,46 @@ class MPT(Algo):
         return b
 
 
-class CovarianceEstimator(object):
-    """ Estimator which accepts sklearn objects. """
+# regularization parameter for singular cases
+ALPHA = 0.000001
 
-    def __init__(self, cov_est, window):
-        self.cov_est = cov_est
-        self.window = window
+def _maximize(mu, sigma, q, n, G, h, symbols, last_b, force_weights):
+    P = matrix(2 * (sigma + ALPHA * np.eye(n)))
+    q = matrix(-q * mu + 2 * ALPHA * last_b.values)
 
-    def fit(self, X):
-        # only use last window
-        if self.window:
-            X = X.iloc[-self.window:]
+    A = matrix(np.ones(n)).T
+    b = matrix(np.array([1.]))
 
-        # remove zero-variance elements
-        zero_variance = X.std() == 0
-        Y = X.iloc[:, ~zero_variance.values]
+    for sym, w in force_weights.items():
+        ix = symbols.index(sym)
+        a = np.zeros(n)
+        a[ix] = 1
+        A = matrix(np.r_[A, matrix(a).T])
+        b = matrix(np.r_[b, matrix([w])])
 
-        # can estimator handle NaN values?
-        if getattr(self.cov_est, 'allow_nan', False):
-            self.cov_est.fit(Y)
-            cov = pd.DataFrame(self.cov_est.covariance_, index=Y.columns, columns=Y.columns)
-        else:
-            # estimation for matrix without NaN values - should be larger than min_history
-            cov = self.cov_est.fit(Y).covariance_
-            cov = pd.DataFrame(cov, index=Y.columns, columns=Y.columns)
+    sol = solvers.qp(P, q, G, h, A, b, initvals=last_b)
 
-            # NOTE: nonsense - we wouldn't get positive-semidefinite matrix
-            # improve estimation for those with full history
-            # Y = Y.dropna(1, how='any')
-            # full_cov = self.cov_est.fit(Y).covariance_
-            # full_cov = pd.DataFrame(full_cov, index=Y.columns, columns=Y.columns)
-            # cov.update(full_cov)
+    if sol['status'] != 'optimal':
+        logging.warning("Solution not found for {}, using last weights".format(last_b.name))
+        return last_b
 
-        # put back zero covariance
-        cov = cov.reindex(X.columns).reindex(columns=X.columns).fillna(0.)
+    return np.squeeze(sol['x'])
 
-        # turn on?
-        # assert np.linalg.eig(cov)[0].min() > 0
+def _maximize_with_penalization(b, last_b, mu, sigma, q, gamma):
+    n = len(mu)
+    c = np.sign(b - last_b)
+    sigma = matrix(sigma)
+    mu = matrix(mu)
 
-        # annualize covariance
-        cov *= tools.freq(X.index)
+    P = 2 * (sigma + ALPHA * matrix(np.eye(n)))
+    qq = 2 * sigma * matrix(last_b) - q * mu + matrix(gamma * c)
 
-        return cov
+    G = matrix(np.r_[-np.diag(c), np.eye(n), -np.eye(n)])
+    h = matrix(np.r_[np.zeros(n), 1. - last_b, last_b])
+
+    A = matrix(np.ones(n)).T
+    b = matrix([1. - sum(last_b)])
+
+    sol = solvers.qp(P, qq, G, h, A, b, initvals=np.zeros(n))
+
+    return np.squeeze(sol['x']) + np.array(last_b)

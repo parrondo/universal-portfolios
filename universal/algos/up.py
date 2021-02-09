@@ -27,11 +27,12 @@ class UP(Algo):
             in portfolio.
         """
         super(UP, self).__init__()
-        self.eval_points = eval_points
+        self.eval_points = int(eval_points)
         self.leverage = leverage
 
 
-    def init_weights(self, m):
+    def init_weights(self, columns):
+        m = len(columns)
         return np.ones(m) / m
 
 
@@ -49,7 +50,7 @@ class UP(Algo):
         self.W = (self.W - 1./m) * stretch + 1./m
 
 
-    def step(self, x, last_b):
+    def step(self, x, last_b, history):
         # calculate new wealth of all CRPs
         self.S = np.multiply(self.S, self.W * np.matrix(x).T)
         b = self.W.T * self.S
